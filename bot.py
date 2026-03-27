@@ -7,36 +7,14 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 import httpx
 
-# ── ENV VARS WITH VALIDATION ──────────────────────────────
-def get_env(key, cast=str):
-    val = os.environ.get(key)
-    if val is None:
-        raise EnvironmentError(f"❌ Missing environment variable: {key}")
-    try:
-        return cast(val.strip())
-    except Exception:
-        raise EnvironmentError(f"❌ Invalid value for {key}: '{val}'")
+# ── ENV VARS ──────────────────────────────────────────────
+API_ID        = 22315270
+API_HASH      = os.environ.get("API_HASH")
+BOT_TOKEN     = os.environ.get("BOT_TOKEN")
+TWITTER_BEARER = os.environ.get("TWITTER_BEARER_TOKEN")
+ALERT_CHAT_ID = 7943437049  # Your Telegram chat/group ID
 
-try:
-    API_ID         = get_env("API_ID", int)
-    API_HASH       = get_env("API_HASH")
-    BOT_TOKEN      = get_env("BOT_TOKEN")
-    TWITTER_BEARER = get_env("TWITTER_BEARER_TOKEN")
-    ALERT_CHAT_ID  = get_env("ALERT_CHAT_ID", int)
-    print("✅ All environment variables loaded successfully")
-    print(f"   API_ID: {API_ID}")
-    print(f"   API_HASH: {API_HASH[:6]}...")
-    print(f"   BOT_TOKEN: {BOT_TOKEN[:10]}...")
-    print(f"   ALERT_CHAT_ID: {ALERT_CHAT_ID}")
-except EnvironmentError as e:
-    print(str(e))
-    print("\n📋 Available environment variables:")
-    for k, v in os.environ.items():
-        if any(x in k.upper() for x in ["API", "BOT", "TWITTER", "ALERT", "CHAT"]):
-            print(f"   {k} = {v[:10]}...")
-    exit(1)
-
-# ── STORAGE ───────────────────────────────────────────────
+# ── STORAGE (in-memory, survives restarts via JSON file) ──
 TRACKED_FILE = "tracked_accounts.json"
 
 def load_tracked():
@@ -49,12 +27,14 @@ def save_tracked(accounts):
     with open(TRACKED_FILE, "w") as f:
         json.dump(accounts, f)
 
-tracked_accounts = load_tracked()
+tracked_accounts = load_tracked()  # List of X usernames to monitor
 
 # ── SOLANA CA DETECTION ───────────────────────────────────
 def extract_solana_ca(text):
+    # Solana addresses are base58, 32-44 chars
     pattern = r'\b[1-9A-HJ-NP-Za-km-z]{32,44}\b'
     matches = re.findall(pattern, text)
+    # Filter out common non-CA strings
     return [m for m in matches if len(m) >= 40]
 
 # ── GET TOKEN INFO FROM DEXSCREENER ──────────────────────
@@ -70,7 +50,7 @@ async def get_token_info(ca: str):
                     "name": p.get("baseToken", {}).get("name", "Unknown"),
                     "symbol": p.get("baseToken", {}).get("symbol", "???"),
                     "price": p.get("priceUsd", "N/A"),
-                    "liquidity": p.get("liquidity", {}).get("usd", 0),
+                    "liquidity": p.get("liquidity", {}).get("usd", "N/A"),
                     "market_cap": p.get("marketCap", "N/A"),
                     "dex": p.get("dexId", "N/A"),
                     "url": p.get("url", "")
@@ -86,7 +66,7 @@ app = Client("sniper_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN
 async def start(client, message: Message):
     await message.reply(
         "🎯 **Solana CA Sniper Bot**\n\n"
-        "I monitor X (Twitter) accounts and alert you the moment they post a Solana CA!\n\n"
+        "I monitor X (Twitter) accounts and alert you the moment they post a Solana contract address!\n\n"
         "**Commands:**\n"
         "`/add @username` — Track an X account\n"
         "`/remove @username` — Stop tracking\n"
@@ -103,6 +83,7 @@ async def add_account(client, message: Message):
 
     username = parts[1].lstrip("@").lower()
 
+    # Verify account exists on X
     try:
         tw_client = tweepy.Client(bearer_token=TWITTER_BEARER)
         user = tw_client.get_user(username=username)
@@ -159,7 +140,7 @@ async def poll_twitter():
     print("🔄 Twitter polling started...")
 
     while True:
-        for username in list(tracked_accounts):
+        for username in tracked_accounts:
             try:
                 user = tw_client.get_user(username=username)
                 if not user.data:
@@ -193,7 +174,7 @@ async def poll_twitter():
                                     f"🪙 **{token_info['name']} (${token_info['symbol']})**\n"
                                     f"💰 Price: `${token_info['price']}`\n"
                                     f"💧 Liquidity: `${token_info['liquidity']:,}`\n"
-                                    f"📊 Market Cap: `${token_info['market_cap']}`\n"
+                                    f"📊 Market Cap: `${token_info['market_cap']:,}`\n"
                                     f"🔁 DEX: `{token_info['dex']}`\n\n"
                                     f"📋 **CA:**\n`{ca}`\n\n"
                                     f"🔗 [DexScreener]({token_info['url']}) | "
@@ -216,7 +197,7 @@ async def poll_twitter():
             except Exception as e:
                 print(f"⚠️ Error polling @{username}: {e}")
 
-        await asyncio.sleep(30)
+        await asyncio.sleep(30)  # Poll every 30 seconds
 
 # ── MAIN ──────────────────────────────────────────────────
 async def main():
