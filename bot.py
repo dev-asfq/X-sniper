@@ -13,62 +13,33 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID  = int(os.environ.get("ADMIN_ID", "0"))
 
 if not BOT_TOKEN:
-    raise EnvironmentError("❌ Missing BOT_TOKEN environment variable")
+    raise EnvironmentError("❌ Missing BOT_TOKEN")
 
 print("✅ Environment variables loaded!")
-
-# ── BOT SETUP ─────────────────────────────────────────────
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# ── NITTER INSTANCE MANAGER ───────────────────────────────
-# Hardcoded base list — bot will also fetch live instances on startup
-BASE_INSTANCES = [
-    "https://nitter.net",
-    "https://nitter.poast.org",
-    "https://nitter.privacydev.net",
-    "https://nitter.1d4.us",
-    "https://nitter.lucabased.xyz",
-    "https://nitter.lunar.icu",
-    "https://nitter.rawbit.ninja",
-    "https://nitter.moomoo.me",
-    "https://nitter.tiekoetter.com",
-    "https://nitter.it",
+# ── RSS SOURCES (multiple providers for redundancy) ───────
+# Each provider is tried in order until one works
+RSS_PROVIDERS = [
+    # RSSHub public instances — mirrors Twitter/X feeds
+    lambda u: f"https://rsshub.app/twitter/user/{u}",
+    lambda u: f"https://rsshub.rssforever.com/twitter/user/{u}",
+    lambda u: f"https://hub.slarker.me/twitter/user/{u}",
+    lambda u: f"https://rsshub.cachix.org/twitter/user/{u}",
+    # Nitter instances as final fallback
+    lambda u: f"https://nitter.poast.org/{u}/rss",
+    lambda u: f"https://nitter.moomoo.me/{u}/rss",
+    lambda u: f"https://nitter.tiekoetter.com/{u}/rss",
+    lambda u: f"https://nitter.it/{u}/rss",
 ]
 
-working_instances = BASE_INSTANCES.copy()
-failed_counts = {}  # track failures per instance
+failed_counts = {}
 
-def fetch_live_instances():
-    """Fetch currently working instances from Twiiit/nitter wiki"""
-    global working_instances
-    try:
-        # Twiiit redirects to a random working instance — we can use it to find live ones
-        r = httpx.get("https://twiiit.com", timeout=10, follow_redirects=False)
-        location = r.headers.get("location", "")
-        if location and location.startswith("http"):
-            instance = "/".join(location.split("/")[:3])
-            if instance not in working_instances:
-                working_instances.insert(0, instance)
-                print(f"✅ Found live Nitter instance via Twiiit: {instance}")
-    except Exception as e:
-        print(f"⚠️ Could not fetch live instances: {e}")
+def mark_failed(url):
+    failed_counts[url] = failed_counts.get(url, 0) + 1
 
-def get_best_instance():
-    """Return a random working instance, avoiding ones with too many failures"""
-    good = [i for i in working_instances if failed_counts.get(i, 0) < 3]
-    if not good:
-        # Reset all failure counts and try again
-        failed_counts.clear()
-        good = working_instances
-    return random.choice(good) if good else working_instances[0]
-
-def mark_failed(instance):
-    failed_counts[instance] = failed_counts.get(instance, 0) + 1
-    if failed_counts[instance] >= 3:
-        print(f"⚠️ Instance {instance} marked as bad (3 failures)")
-
-def mark_success(instance):
-    failed_counts[instance] = 0  # Reset on success
+def mark_success(url):
+    failed_counts[url] = 0
 
 # ── STORAGE ───────────────────────────────────────────────
 TRACKED_FILE = "tracked_accounts.json"
@@ -94,39 +65,37 @@ def extract_solana_ca(text):
     matches = re.findall(pattern, text)
     return [m for m in matches if len(m) >= 40]
 
-# ── FETCH TWEETS VIA NITTER RSS ───────────────────────────
+# ── FETCH TWEETS VIA RSS ──────────────────────────────────
 def fetch_tweets(username: str):
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/rss+xml, application/xml, text/xml, */*"
     }
 
-    # Try up to 5 different instances before giving up
-    tried = set()
-    for _ in range(5):
-        instance = get_best_instance()
-        if instance in tried:
+    for provider in RSS_PROVIDERS:
+        url = provider(username)
+
+        # Skip consistently failing URLs
+        if failed_counts.get(url, 0) >= 3:
             continue
-        tried.add(instance)
 
         try:
-            url = f"{instance}/{username}/rss"
-            r = httpx.get(url, headers=headers, timeout=12, follow_redirects=True)
+            r = httpx.get(url, headers=headers, timeout=15, follow_redirects=True)
 
             if r.status_code == 429:
-                print(f"⚠️ Rate limited on {instance}")
-                mark_failed(instance)
+                print(f"⚠️ Rate limited: {url}")
+                mark_failed(url)
                 continue
 
             if r.status_code != 200:
-                print(f"⚠️ {instance} returned {r.status_code}")
-                mark_failed(instance)
+                print(f"⚠️ {url} returned {r.status_code}")
+                mark_failed(url)
                 continue
 
-            # Try parsing XML
             root = ElementTree.fromstring(r.text)
             channel = root.find("channel")
             if channel is None:
-                mark_failed(instance)
+                mark_failed(url)
                 continue
 
             tweets = []
@@ -136,27 +105,27 @@ def fetch_tweets(username: str):
                 desc      = item.findtext("description", "")
                 guid      = item.findtext("guid", link)
                 full_text = re.sub(r'<[^>]+>', ' ', f"{title} {desc}")
+                # Clean up link to point to x.com
+                if "nitter" in link:
+                    link = re.sub(r'https?://[^/]+/', 'https://x.com/', link)
                 tweets.append({"id": guid, "text": full_text, "link": link})
 
-            mark_success(instance)
-            print(f"✅ Fetched {len(tweets)} tweets for @{username} via {instance}")
+            mark_success(url)
+            print(f"✅ Got {len(tweets)} tweets for @{username} via {url.split('/')[2]}")
             return tweets
 
         except Exception as e:
-            print(f"⚠️ Nitter {instance} failed for @{username}: {e}")
-            mark_failed(instance)
+            print(f"⚠️ {url} failed: {e}")
+            mark_failed(url)
             continue
 
-    print(f"❌ All instances failed for @{username}")
+    print(f"❌ All RSS providers failed for @{username}")
     return []
 
 # ── GET TOKEN INFO FROM DEXSCREENER ──────────────────────
 def get_token_info(ca: str):
     try:
-        r = httpx.get(
-            f"https://api.dexscreener.com/latest/dex/tokens/{ca}",
-            timeout=10
-        )
+        r = httpx.get(f"https://api.dexscreener.com/latest/dex/tokens/{ca}", timeout=10)
         data = r.json()
         pairs = data.get("pairs", [])
         if pairs:
@@ -177,14 +146,13 @@ def get_token_info(ca: str):
 def is_admin(message):
     return message.from_user.id == ADMIN_ID
 
-# ── BROADCAST TO ALL SUBSCRIBERS ─────────────────────────
+# ── BROADCAST ─────────────────────────────────────────────
 def broadcast_alert(msg: str):
     failed = []
     for uid in list(subscribed_users):
         try:
             bot.send_message(uid, msg, parse_mode="Markdown", disable_web_page_preview=True)
-        except Exception as e:
-            print(f"⚠️ Failed to send to {uid}: {e}")
+        except:
             failed.append(uid)
     for uid in failed:
         subscribed_users.discard(uid)
@@ -200,11 +168,11 @@ def start(message):
     save_json(USERS_FILE, list(subscribed_users))
     bot.reply_to(message, (
         f"👋 Hey *{name}*! Welcome to Solana CA Sniper Bot!\n\n"
-        f"🎯 I monitor X accounts and alert you the moment they post a Solana CA!\n\n"
+        f"🎯 I monitor X accounts and instantly alert you when they post a Solana CA!\n\n"
         f"✅ You're now *subscribed* to all alerts!\n\n"
         f"*Commands:*\n"
-        f"`/stop` — Unsubscribe from alerts\n"
-        f"`/list` — See tracked X accounts\n"
+        f"`/stop` — Unsubscribe\n"
+        f"`/list` — See tracked accounts\n"
         f"`/status` — Bot stats"
     ), parse_mode="Markdown")
 
@@ -221,19 +189,19 @@ def stop(message):
 @bot.message_handler(commands=['list'])
 def list_accounts(message):
     if not tracked_accounts:
-        bot.reply_to(message, "📭 No X accounts being tracked yet.")
+        bot.reply_to(message, "📭 No accounts tracked yet.")
         return
     accs = "\n".join([f"• @{a}" for a in tracked_accounts])
     bot.reply_to(message, f"👀 *Tracked X Accounts:*\n\n{accs}", parse_mode="Markdown")
 
 @bot.message_handler(commands=['status'])
 def status(message):
-    good_instances = len([i for i in working_instances if failed_counts.get(i, 0) < 3])
+    healthy = len([u for u, c in failed_counts.items() if c < 3])
     bot.reply_to(message, (
         f"✅ *Bot Status*\n\n"
         f"👀 Tracking: *{len(tracked_accounts)}* X accounts\n"
         f"👥 Subscribers: *{len(subscribed_users)}* users\n"
-        f"🌐 Nitter instances: *{good_instances}/{len(working_instances)}* healthy\n"
+        f"🌐 RSS providers: *{len(RSS_PROVIDERS)}* total\n"
         f"🔄 Polling every 60 seconds"
     ), parse_mode="Markdown")
 
@@ -241,7 +209,7 @@ def status(message):
 @bot.message_handler(commands=['add'])
 def add_account(message):
     if not is_admin(message):
-        bot.reply_to(message, "❌ Only the bot admin can add tracked accounts.")
+        bot.reply_to(message, "❌ Only the bot admin can add accounts.")
         return
     parts = message.text.split()
     if len(parts) < 2:
@@ -258,7 +226,7 @@ def add_account(message):
 @bot.message_handler(commands=['remove'])
 def remove_account(message):
     if not is_admin(message):
-        bot.reply_to(message, "❌ Only the bot admin can remove tracked accounts.")
+        bot.reply_to(message, "❌ Only the bot admin can remove accounts.")
         return
     parts = message.text.split()
     if len(parts) < 2:
@@ -299,66 +267,56 @@ def show_users(message):
 
 # ── POLLING LOOP ──────────────────────────────────────────
 def poll_loop():
-    # Fetch live instances on startup
-    fetch_live_instances()
-    print("🔄 Polling started via Nitter RSS...")
-
+    print("🔄 Polling started...")
     cycle = 0
     while True:
-        # Every 10 cycles (~10 mins), refresh live instances
-        if cycle % 10 == 0:
-            fetch_live_instances()
+        # Reset failure counts every 20 cycles so dead instances get retried
+        if cycle % 20 == 0 and cycle > 0:
+            failed_counts.clear()
+            print("🔄 Reset instance failure counts")
         cycle += 1
 
         for username in list(tracked_accounts.keys()):
             try:
                 tweets = fetch_tweets(username)
-                if not tweets:
-                    continue
-
                 for tweet in tweets:
                     tweet_id = tweet["id"]
                     if tweet_id in seen_tweet_ids:
                         continue
-
                     seen_tweet_ids.add(tweet_id)
                     cas = extract_solana_ca(tweet["text"])
 
-                    if cas:
-                        for ca in cas:
-                            token_info = get_token_info(ca)
-
-                            if token_info:
-                                msg = (
-                                    f"🚨 *CA DETECTED!*\n\n"
-                                    f"👤 Posted by: [@{username}]({tweet['link']})\n\n"
-                                    f"🪙 *{token_info['name']} (${token_info['symbol']})*\n"
-                                    f"💰 Price: `${token_info['price']}`\n"
-                                    f"💧 Liquidity: `${token_info['liquidity']:,}`\n"
-                                    f"📊 Market Cap: `${token_info['market_cap']}`\n"
-                                    f"🔁 DEX: `{token_info['dex']}`\n\n"
-                                    f"📋 *CA:*\n`{ca}`\n\n"
-                                    f"🔗 [DexScreener]({token_info['url']}) | "
-                                    f"[Pump.fun](https://pump.fun/{ca}) | "
-                                    f"[Birdeye](https://birdeye.so/token/{ca})"
-                                )
-                            else:
-                                msg = (
-                                    f"🚨 *CA DETECTED!*\n\n"
-                                    f"👤 Posted by: [@{username}]({tweet['link']})\n\n"
-                                    f"📋 *CA:*\n`{ca}`\n\n"
-                                    f"🔗 [Pump.fun](https://pump.fun/{ca}) | "
-                                    f"[Birdeye](https://birdeye.so/token/{ca}) | "
-                                    f"[DexScreener](https://dexscreener.com/solana/{ca})"
-                                )
-
-                            broadcast_alert(msg)
-                            print(f"✅ Alert broadcasted: {ca} from @{username}")
+                    for ca in cas:
+                        token_info = get_token_info(ca)
+                        if token_info:
+                            msg = (
+                                f"🚨 *CA DETECTED!*\n\n"
+                                f"👤 [@{username}]({tweet['link']})\n\n"
+                                f"🪙 *{token_info['name']} (${token_info['symbol']})*\n"
+                                f"💰 Price: `${token_info['price']}`\n"
+                                f"💧 Liquidity: `${token_info['liquidity']:,}`\n"
+                                f"📊 Market Cap: `${token_info['market_cap']}`\n"
+                                f"🔁 DEX: `{token_info['dex']}`\n\n"
+                                f"📋 *CA:*\n`{ca}`\n\n"
+                                f"🔗 [DexScreener]({token_info['url']}) | "
+                                f"[Pump.fun](https://pump.fun/{ca}) | "
+                                f"[Birdeye](https://birdeye.so/token/{ca})"
+                            )
+                        else:
+                            msg = (
+                                f"🚨 *CA DETECTED!*\n\n"
+                                f"👤 [@{username}]({tweet['link']})\n\n"
+                                f"📋 *CA:*\n`{ca}`\n\n"
+                                f"🔗 [Pump.fun](https://pump.fun/{ca}) | "
+                                f"[Birdeye](https://birdeye.so/token/{ca}) | "
+                                f"[DexScreener](https://dexscreener.com/solana/{ca})"
+                            )
+                        broadcast_alert(msg)
+                        print(f"✅ Broadcasted CA: {ca} from @{username}")
 
             except Exception as e:
                 print(f"⚠️ Error polling @{username}: {e}")
 
-        # Stagger polls slightly to avoid hammering instances
         time.sleep(60)
 
 # ── MAIN ──────────────────────────────────────────────────
